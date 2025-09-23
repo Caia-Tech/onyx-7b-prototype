@@ -117,6 +117,15 @@ class TrainingConfig:
     seed: int = 1337
     dry_run: bool = False
 
+    # Long-context stability features
+    position_jitter_prob: float = 0.0  # 0 disables, >0 adds random position shifts
+    position_jitter_max: int = 4096  # Max left-padding shift for position coverage
+    rope_scaling: Optional[Dict[str, Any]] = None  # RoPE scaling config
+    num_attention_sinks: int = 0  # Learned global KV anchors
+    windowed_attention: bool = False  # Local+global head attention
+    window_size: int = 2048  # Window size for local heads
+    num_global_heads: int = 4  # Heads with full context
+
     def __post_init__(self):
         # Default stage schedule (in tokens)
         if self.stage_schedule is None:
@@ -172,6 +181,9 @@ class StreamingPackedDataset(IterableDataset):
         self.seed = seed
         self.stage_mix = stage_mix or {"cur": 1.0}
         self.current_stage_max = current_stage_max
+        # Position jitter attributes (set from config if available)
+        self.position_jitter_prob = 0.0
+        self.position_jitter_max = 0
 
         # Files
         self.files = sorted(glob.glob(file_pattern, recursive=True))
@@ -215,6 +227,15 @@ class StreamingPackedDataset(IterableDataset):
         packed_ids, doc_spans = [], []
         current_pos = 0
         target_fill = int(target_len * self.fill_ratio)
+
+        # Apply position jitter for better coverage (training only)
+        jitter_offset = 0
+        if hasattr(self, 'position_jitter_prob') and hasattr(self, 'position_jitter_max'):
+            if random.random() < getattr(self, 'position_jitter_prob', 0.0):
+                jitter_offset = random.randint(0, min(getattr(self, 'position_jitter_max', 0), target_len // 2))
+                # Add padding tokens at the start
+                packed_ids = [self.pad_token_id] * jitter_offset
+                current_pos = jitter_offset
 
         for tokens in doc_iterator:
             try:
@@ -360,6 +381,11 @@ def create_dataloader(
         current_stage_max=max_len
     )
 
+    # Set position jitter from config (training only)
+    if not is_eval:
+        dataset.position_jitter_prob = config.position_jitter_prob
+        dataset.position_jitter_max = config.position_jitter_max
+
     # Pad to LOCAL max per batch; mask pads in attention.
     def collate_fn(batch):
         seqs = [x["input_ids"] for x in batch]
@@ -494,6 +520,21 @@ class Trainer:
 
     def _get_stage_max_len(self, stage: str) -> int:
         return stage_to_len(stage)
+
+    def _get_position_bin(self, seq_len: int) -> str:
+        """Get position bin name for metrics"""
+        if seq_len <= 1024:
+            return "0-1k"
+        elif seq_len <= 2048:
+            return "1k-2k"
+        elif seq_len <= 4096:
+            return "2k-4k"
+        elif seq_len <= 8192:
+            return "4k-8k"
+        elif seq_len <= 12288:
+            return "8k-12k"
+        else:
+            return "12k-16k"
 
     def _update_stage(self):
         """Check/update current stage based on global_tokens; update scheduler + grad_accum."""
@@ -666,6 +707,10 @@ class Trainer:
                         current_lr = self.scheduler.get_last_lr()[0] if self.scheduler else self.config.learning_rate
 
                         if self.global_step % self.config.log_every == 0:
+                            # Calculate position bin for this batch
+                            avg_seq_len = int(np.mean([len for len in step_metrics["seq_lens"]]))
+                            position_bin = self._get_position_bin(avg_seq_len)
+
                             log_dict = {
                                 "loss": avg_loss,
                                 "ppl": float(np.exp(avg_loss)),
@@ -674,6 +719,8 @@ class Trainer:
                                 "tokens/sec": tokens_per_sec,
                                 "stage": self.current_stage,
                                 "global_tokens": self.global_tokens,
+                                f"loss_bin_{position_bin}": avg_loss,
+                                "oom_cooldown": self._oom_cooldown,
                             }
                             pbar.set_postfix({
                                 "loss": f"{avg_loss:.4f}",
@@ -707,6 +754,12 @@ class Trainer:
                         if eval_dataloader and self.global_step % self.config.eval_every_steps == 0:
                             eval_metrics = self.evaluate(eval_dataloader)
                             print(f"\n📊 Eval @ step {self.global_step}: loss {eval_metrics['eval_loss']:.4f} | ppl {eval_metrics['eval_ppl']:.2f}")
+                            # Log position-binned eval metrics
+                            for bucket_name, losses in losses_by_bucket.items():
+                                bin_loss = float(np.mean(losses))
+                                eval_metrics[f"eval_loss_bin_{bucket_name}"] = bin_loss
+                                eval_metrics[f"eval_ppl_{bucket_name}"] = float(np.exp(bin_loss))
+
                             for b in ["≤1k", "1-2k", "2-4k", "4-8k", "8-16k"]:
                                 k = f"eval_ppl_{b}"
                                 if k in eval_metrics:
@@ -855,7 +908,29 @@ def main():
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--dry_run", action="store_true")
 
+    # Long-context stability features
+    parser.add_argument("--position_jitter_prob", type=float, default=0.0,
+                        help="Probability of applying position jitter (0-1)")
+    parser.add_argument("--position_jitter_max", type=int, default=4096,
+                        help="Maximum left-padding shift for position coverage")
+    parser.add_argument("--rope_scaling", type=str, default=None,
+                        help='RoPE scaling config as JSON (e.g., \'{"type":"ntk","factor":1.5}\')')
+    parser.add_argument("--num_attention_sinks", type=int, default=0,
+                        help="Number of learned global KV anchors (0 disables)")
+    parser.add_argument("--windowed_attention", action="store_true",
+                        help="Enable windowed attention with local and global heads")
+    parser.add_argument("--window_size", type=int, default=2048,
+                        help="Window size for local attention heads")
+    parser.add_argument("--num_global_heads", type=int, default=4,
+                        help="Number of heads with full context in windowed attention")
+
     args = parser.parse_args()
+
+    # Parse rope_scaling JSON if provided
+    if args.rope_scaling:
+        import json
+        args.rope_scaling = json.loads(args.rope_scaling)
+
     config = TrainingConfig(**vars(args))
 
     # Seeds / CUDA
@@ -887,7 +962,13 @@ def main():
         eod_token_id=eod_id,
         block_cross_doc_attention=config.block_cross_doc_attention,
         gradient_checkpointing=config.gradient_checkpointing,
-        use_torch_compile=config.compile_model
+        use_torch_compile=config.compile_model,
+        # Long-context stability features
+        rope_scaling=config.rope_scaling,
+        num_attention_sinks=config.num_attention_sinks,
+        windowed_attention=config.windowed_attention,
+        window_size=config.window_size,
+        num_global_heads=config.num_global_heads
     )
     model = Onyx7B(model_config).to(device=device, dtype=(torch.bfloat16 if config.bf16 else torch.float16))
 
