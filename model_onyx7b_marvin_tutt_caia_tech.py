@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Onyx 7B Dense Model - Production Ready
-All fixes applied for PyTorch 2.8 + FlashAttention v2
+Onyx 7B Dense Model, Marvin Tutt, Caia Tech
 """
 
 import torch
@@ -20,6 +19,15 @@ except ImportError:
     FLASH_AVAILABLE = False
     warnings.warn("FlashAttention not available, using PyTorch SDPA", stacklevel=2)
 
+# Optional varlen FA2 (removes padding compute). We guard import and feature flag.
+VARLEN_FA_AVAILABLE = False
+try:
+    # FA2 varlen kernels (natively support causal attention and dropout)
+    from flash_attn import flash_attn_varlen_qkvpacked_func as fa_varlen_qkv
+    VARLEN_FA_AVAILABLE = True
+except Exception:
+    pass
+
 
 @dataclass
 class OnyxConfig:
@@ -32,8 +40,11 @@ class OnyxConfig:
     n_kv_heads: int = 8           # GQA 4:1 ratio
     d_ff: int = 11008             # FFN dimension
     max_seq_len: int = 16384      # 16k context
-    
+
     eos_token_id: int = 2         # EOS token ID for generation
+    pad_token_id: int = 0         # Padding token ID
+    eod_token_id: int = 3         # End-of-document token ID
+    block_cross_doc_attention: bool = False  # Block attention across documents
     
     # Position encoding
     rope_theta: float = 500000.0  # Extended RoPE for long context
@@ -47,6 +58,7 @@ class OnyxConfig:
     
     # Performance optimizations
     use_flash_attn: bool = True   # FlashAttention v2
+    use_varlen_flash_attn: bool = True  # Try varlen FA2 fast path when available
     use_cuda_graphs: bool = False # Reserved for future optimization
     use_torch_compile: bool = True # torch.compile optimization
     
@@ -160,7 +172,7 @@ class RoPE(nn.Module):
 
 class OptimizedAttention(nn.Module):
     """Multi-head attention with GQA and proper KV cache"""
-    
+
     def __init__(self, config: OnyxConfig):
         super().__init__()
         self.config = config
@@ -169,24 +181,29 @@ class OptimizedAttention(nn.Module):
         self.n_kv_heads = config.n_kv_heads
         self.head_dim = self.d_model // self.n_heads
         self.n_rep = self.n_heads // self.n_kv_heads
-        
+
         # Projections
         self.q_proj = nn.Linear(self.d_model, self.n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.d_model, self.n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.d_model, self.n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
-        
+
         # RoPE
         self.rope = RoPE(config)
-        
+
         # Dropout
         self.dropout = nn.Dropout(config.attention_dropout)
-    
+
     def forward(
         self,
         x: torch.Tensor,
         use_cache: bool = False,
-        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        seq_lens: Optional[torch.Tensor] = None,  # Shape (B,)
+        cu_seqlens: Optional[torch.Tensor] = None,  # Cumulative seqlens for varlen
+        max_seqlen: Optional[int] = None,  # Max seq length in batch
+        attn_mask: Optional[torch.Tensor] = None,  # Prebuilt attention mask
+        doc_spans: Optional[List[List[Tuple[int, int]]]] = None  # Doc boundaries per sequence
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         batch_size, seq_len, _ = x.shape
         
@@ -200,71 +217,135 @@ class OptimizedAttention(nn.Module):
         if past_kv is not None:
             offset = past_kv[0].shape[2]  # Past sequence length
         q, k = self.rope(q, k, seq_len, offset)
+
+        # Cache base KV (n_kv heads)
+        k_base = k  # (B,S,n_kv,D)
+        v_base = v  # (B,S,n_kv,D)
         
-        # Keep base (B,S,n_kv,D) for cache; compute repeats on the fly
-        q_bshd = q  # (B, S, H, D)
-        k_base = k  # (B, S, n_kv, D)
-        v_base = v  # (B, S, n_kv, D)
-        
-        # If using cache, append on base (n_kv heads) BEFORE any repeat
+        # Append past KV to base (keep n_kv heads compact)
         if past_kv is not None and use_cache:
-            past_k, past_v = past_kv  # both (B, n_kv, S_past, D)
-            # bring base to (B, n_kv, S, D) to concat on seq dim
+            past_k, past_v = past_kv  # (B,n_kv,S_past,D)
             k_cat = torch.cat([past_k, k_base.transpose(1,2)], dim=2)
             v_cat = torch.cat([past_v, v_base.transpose(1,2)], dim=2)
-            k_base = k_cat.transpose(1,2)  # back to (B, S_total, n_kv, D)
+            k_base = k_cat.transpose(1,2)
             v_base = v_cat.transpose(1,2)
-        
-        # Repeat for compute only (don't store repeated in cache)
+
+        # Repeat for compute (GQA)
         if self.n_rep > 1:
-            k_rep = k_base.repeat_interleave(self.n_rep, dim=2)  # (B, S, H, D)
+            k_rep = k_base.repeat_interleave(self.n_rep, dim=2)  # (B,S,H,D)
             v_rep = v_base.repeat_interleave(self.n_rep, dim=2)
         else:
             k_rep, v_rep = k_base, v_base
-        
-        # FlashAttention dtype/device guard
-        use_fa = (
-            FLASH_AVAILABLE and self.config.use_flash_attn and not use_cache
-            and q_bshd.is_cuda and q_bshd.dtype in (torch.float16, torch.bfloat16)
-        )
-        
-        if use_fa:
-            # Ensure contiguous for FA
-            q_bshd = q_bshd.contiguous()
-            k_rep = k_rep.contiguous()
-            v_rep = v_rep.contiguous()
-            
-            # FA path on (B,S,H,D)
+
+        # Shapes for SDPA/FA
+        q_bhsd = q.transpose(1, 2)       # (B,H,S,D)
+        k_bhsd = k_rep.transpose(1, 2)   # (B,H,S,D)
+        v_bhsd = v_rep.transpose(1, 2)   # (B,H,S,D)
+
+        # Decide path:
+        # - If a custom mask is provided (packed sequences and/or block-cross-doc),
+        #   we MUST use SDPA with that mask (FA fixed kernel can't take arbitrary masks).
+        # - Else, use FA when available for performance; otherwise SDPA causal.
+        use_custom_mask = attn_mask is not None
+        can_flat_fa = (not use_custom_mask and FLASH_AVAILABLE and self.config.use_flash_attn
+                       and q.is_cuda and q.dtype in (torch.float16, torch.bfloat16) and not use_cache)
+        use_varlen = (can_flat_fa and VARLEN_FA_AVAILABLE and self.config.use_varlen_flash_attn
+                      and seq_lens is not None and batch_size > 1 and (seq_lens.max() != seq_lens.min()))
+
+        if use_varlen:
+            # Varlen FA2 path: pack QKV and use cu-seqlens to avoid pad compute.
+            # Shapes before packing:
+            #   q: (B,S,H,D), k_rep: (B,S,H,D), v_rep: (B,S,H,D)
+            # Pack (B,S,H,D) -> (T,H,3,D) with QKV interleaved for the kernel.
+            # Build cu_seqlens if not provided.
+            if cu_seqlens is None:
+                seqlens = seq_lens.to(torch.int32).contiguous()
+                cu_seqlens = torch.zeros((batch_size + 1,), dtype=torch.int32, device=q.device)
+                cu_seqlens[1:] = torch.cumsum(seqlens, dim=0)
+                max_seqlen = int(seqlens.max().item())
+            else:
+                max_seqlen = int(max_seqlen or seq_len)
+
+            # Slice each sample to its true length (avoid padded tail) and pack
+            # q/k_rep/v_rep are (B,S,H,D)
+            q_list, k_list, v_list = [], [], []
+            for b in range(batch_size):
+                L = int(seq_lens[b].item())
+                q_list.append(q[b, :L])         # (L,H,D)
+                k_list.append(k_rep[b, :L])     # (L,H,D)
+                v_list.append(v_rep[b, :L])     # (L,H,D)
+            q_cat = torch.cat(q_list, dim=0)    # (T,H,D)
+            k_cat = torch.cat(k_list, dim=0)    # (T,H,D)
+            v_cat = torch.cat(v_list, dim=0)    # (T,H,D)
+
+            # FA2 varlen wants QKV packed as (T, 3, H, D) OR (T, H, 3, D) depending on binding.
+            # The qkvpacked func expects (T, 3, H, D).
+            qkv = torch.stack([q_cat, k_cat, v_cat], dim=1)  # (T, 3, H, D)
+
+            attn_out_varlen = fa_varlen_qkv(
+                qkv.contiguous(),
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                causal=True,
+                softmax_scale=None
+            )  # -> (T, H, D)
+
+            # Unpack back to (B,S,H,D) with pad restored (zeros)
+            out_bshd = q.new_zeros((batch_size, seq_len, self.n_heads, self.head_dim))
+            start = 0
+            for b in range(batch_size):
+                L = int(seq_lens[b].item())
+                out_bshd[b, :L] = attn_out_varlen[start:start+L]
+                start += L
+            # Transpose to match other branches: (B,S,H,D) -> (B,H,S,D)
+            attn_output = out_bshd.transpose(1, 2)
+
+        elif can_flat_fa:
+            # FlashAttention fixed-size causal kernel
+            q_bshd = q  # (B,S,H,D)
+            k_bshd = k_rep
+            v_bshd = v_rep
             attn_output = flash_attn_func(
-                q_bshd, k_rep, v_rep,
+                q_bshd.contiguous(), k_bshd.contiguous(), v_bshd.contiguous(),
                 dropout_p=self.dropout.p if self.training else 0.0,
                 causal=True
-            )  # (B, S, H, D)
-            # align with SDPA downstream
-            attn_output = attn_output.transpose(1, 2)  # -> (B, H, S, D)
+            ).transpose(1, 2)  # -> (B,H,S,D)
         else:
-            # SDPA path expects (B,H,S,D)
-            q = q_bshd.transpose(1, 2)
-            k = k_rep.transpose(1, 2)
-            v = v_rep.transpose(1, 2)
+            # SDPA with mask (or plain causal if mask not provided)
+            # If a boolean mask is provided as [B,S,S], SDPA expects broadcastable
+            #   (B, 1, S, S) or (B, H, S, S). We'll expand to (B,1,S,S).
+            sdpa_mask = None
+            if attn_mask is not None:
+                if attn_mask.dtype == torch.bool:
+                    # Use float32 for mask to avoid numerical issues with -inf in bf16/fp16
+                    sdpa_mask = torch.zeros_like(attn_mask, dtype=torch.float32, device=q_bhsd.device)
+                    sdpa_mask.masked_fill_(~attn_mask, float('-inf'))
+                    sdpa_mask = sdpa_mask.unsqueeze(1)  # (B,1,S,S)
+                else:
+                    sdpa_mask = attn_mask
+                    if sdpa_mask.dim() == 3:
+                        sdpa_mask = sdpa_mask.unsqueeze(1)  # (B,1,S,S)
+
             attn_output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,  # No mask - let SDPA handle it
+                q_bhsd, k_bhsd, v_bhsd,
+                attn_mask=sdpa_mask,
                 dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=True  # This is the key - SDPA handles causal masking
+                is_causal=(sdpa_mask is None)  # causal only when no explicit mask
             )
         
-        # Reshape and project
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        # Merge heads and project out
+        attn_output = attn_output.transpose(1, 2).contiguous()  # (B,S,H,D)
         attn_output = attn_output.view(batch_size, seq_len, self.d_model)
         output = self.o_proj(attn_output)
-        
-        # Cache compact n_kv heads (4x memory savings)
+
+        # Return compact KV cache (n_kv heads)
+        new_kv = None
         if use_cache:
             new_kv = (k_base.transpose(1,2).contiguous(), v_base.transpose(1,2).contiguous())
-        else:
-            new_kv = None
-        
+
         return output, new_kv
 
 
@@ -323,13 +404,14 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         use_cache: bool = False,
-        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **attn_kwargs
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Pre-norm architecture
         # Attention block
         residual = x
         x = self.norm1(x)
-        attn_out, new_kv = self.attention(x, use_cache, past_kv)
+        attn_out, new_kv = self.attention(x, use_cache, past_kv, **attn_kwargs)
         x = residual + attn_out
         
         # FFN block
@@ -383,7 +465,12 @@ class Onyx7B(nn.Module):
         labels: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-        return_dict: bool = True
+        return_dict: bool = True,
+        seq_lens: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        doc_spans: Optional[List[List[Tuple[int, int]]]] = None
     ) -> Dict[str, Any]:
         """
         Forward pass with KV cache support
@@ -418,12 +505,22 @@ class Onyx7B(nn.Module):
             if self.config.gradient_checkpointing and self.training:
                 # Training: checkpoint tensor-only, no cache
                 def cf(h):
-                    y, _ = layer(h, use_cache=False, past_kv=None)
+                    y, _ = layer(
+                        h, use_cache=False, past_kv=None,
+                        attn_mask=attn_mask, seq_lens=seq_lens,
+                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                        doc_spans=doc_spans
+                    )
                     return y
                 hidden_states = torch.utils.checkpoint.checkpoint(cf, hidden_states, use_reentrant=False)
                 new_kv = None
             else:
-                hidden_states, new_kv = layer(hidden_states, use_cache, past_kv)
+                hidden_states, new_kv = layer(
+                    hidden_states, use_cache, past_kv,
+                    attn_mask=attn_mask, seq_lens=seq_lens,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                    doc_spans=doc_spans
+                )
             
             if use_cache:
                 new_past_key_values.append(new_kv)
@@ -576,6 +673,69 @@ class Onyx7B(nn.Module):
             "decay": decay_params,
             "no_decay": no_decay_params
         }
+
+
+def build_block_causal_mask(
+    seq_lens: torch.Tensor,
+    doc_spans: Optional[List[List[Tuple[int, int]]]] = None,
+    block_cross_doc: bool = False,
+    device: torch.device = None,
+    dtype: torch.dtype = torch.bool,
+) -> torch.Tensor:
+    """
+    Build attention mask for packed sequences with optional document blocking.
+
+    Returns a boolean attention mask of shape [B, S, S]:
+      True  => keep (allowed to attend)
+      False => mask (disallow)
+
+    It is lower-triangular causal and, if block_cross_doc is True, disallows
+    attending across document boundaries inside the packed sequence.
+
+    Args:
+        seq_lens: Actual sequence lengths (B,)
+        doc_spans: Document boundaries per sequence
+        block_cross_doc: Whether to block attention across documents
+        device: Target device
+        dtype: Output dtype (bool for mask, float for scores)
+
+    Returns:
+        Attention mask (B, S, S)
+    """
+    assert seq_lens.dim() == 1
+    B = seq_lens.size(0)
+    S = int(seq_lens.max().item())
+    device = device or seq_lens.device
+
+    # Base causal (lower-triangular)
+    mask = torch.ones((B, S, S), device=device, dtype=torch.bool)
+    tri = torch.tril(torch.ones((S, S), device=device, dtype=torch.bool))
+    mask = mask & tri.unsqueeze(0)
+
+    # Invalidate padding positions (rows and cols >= L_i)
+    for b in range(B):
+        L = int(seq_lens[b].item())
+        if L < S:
+            mask[b, L:, :] = False
+            mask[b, :, L:] = False
+
+    if block_cross_doc and doc_spans is not None:
+        # Turn off attention across different spans
+        for b in range(B):
+            spans = doc_spans[b]
+            if not spans:
+                continue
+            # Build segment id per token
+            seg = torch.full((S,), -1, device=device, dtype=torch.int32)
+            for idx, (st, en) in enumerate(spans):
+                en = min(en, S)
+                seg[st:en] = idx
+            # Disallow attention where seg differs (but keep causal)
+            same = torch.eq(seg.unsqueeze(0), seg.unsqueeze(1))  # [S,S]
+            mask[b] = mask[b] & same
+
+    # Return boolean mask (caller will convert if needed)
+    return mask
 
 
 def create_onyx_7b(
