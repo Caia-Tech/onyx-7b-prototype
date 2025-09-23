@@ -48,7 +48,10 @@ class OnyxConfig:
     
     # Position encoding
     rope_theta: float = 500000.0  # Extended RoPE for long context
-    rope_scaling: Optional[Dict] = None  # Reserved for future scaling
+    rope_scaling: Optional[Dict[str, Any]] = None  # NTK/YARN scaling
+    # Examples:
+    # {"type": "ntk", "factor": 1.5}
+    # {"type": "yarn", "factor": 2.0, "orig_ctx": 4096}
     
     # Architecture features
     use_swiglu: bool = True       # SwiGLU activation
@@ -69,6 +72,12 @@ class OnyxConfig:
     
     # Embeddings
     tie_embeddings: bool = True
+
+    # Long-context stability features
+    num_attention_sinks: int = 0  # 0 disables, >0 adds learned global KV anchors
+    windowed_attention: bool = False  # Enable local+global head attention
+    window_size: int = 2048  # Window size for local heads
+    num_global_heads: int = 4  # Number of heads with full context
     
     def __post_init__(self):
         if self.n_heads % self.n_kv_heads != 0:
@@ -97,25 +106,46 @@ class RMSNorm(nn.Module):
 
 class RoPE(nn.Module):
     """Rotary Position Embeddings with correct even/odd implementation"""
-    
+
     def __init__(self, config: OnyxConfig):
         super().__init__()
         self.max_seq_len = config.max_seq_len
         self.d_model = config.d_model
         self.n_heads = config.n_heads
         self.theta = config.rope_theta
+        self.rope_scaling = config.rope_scaling
         self.head_dim = self.d_model // self.n_heads
-        
-        # Precompute frequencies
+
+        # Precompute frequencies with optional scaling
         self.register_buffer(
             "freqs",
             self._compute_freqs(),
             persistent=False  # Don't save in state_dict
         )
-    
+
     def _compute_freqs(self) -> torch.Tensor:
-        # Frequencies for pairs of dimensions
-        freqs = 1.0 / (self.theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        # Base frequencies for pairs of dimensions
+        theta = self.theta
+
+        # Apply RoPE scaling if configured
+        if self.rope_scaling is not None:
+            scaling_type = self.rope_scaling.get("type", "none")
+            scaling_factor = self.rope_scaling.get("factor", 1.0)
+
+            if scaling_type == "ntk":
+                # Neural Tangent Kernel scaling - slow down rotation
+                theta = theta * scaling_factor
+            elif scaling_type == "yarn":
+                # YaRN scaling - more sophisticated frequency adjustment
+                orig_ctx = self.rope_scaling.get("orig_ctx", 4096)
+                # Compute scaled theta per YaRN paper
+                # For simplicity, using NTK-style scaling with adjustment
+                # Full YaRN would require position-dependent scaling
+                ratio = self.max_seq_len / orig_ctx
+                if ratio > 1.0:
+                    theta = theta * (scaling_factor ** (self.head_dim / (self.head_dim - 2)))
+
+        freqs = 1.0 / (theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
         return freqs
     
     def forward(
@@ -194,6 +224,17 @@ class OptimizedAttention(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(config.attention_dropout)
 
+        # Attention sinks (learned global KV anchors)
+        if config.num_attention_sinks > 0:
+            # Store as (n_kv_heads, head_dim, num_sinks) for easy expansion
+            self.k_sinks = nn.Parameter(torch.zeros(self.n_kv_heads, self.head_dim, config.num_attention_sinks))
+            self.v_sinks = nn.Parameter(torch.zeros(self.n_kv_heads, self.head_dim, config.num_attention_sinks))
+            nn.init.normal_(self.k_sinks, std=0.02)
+            nn.init.normal_(self.v_sinks, std=0.02)
+        else:
+            self.k_sinks = None
+            self.v_sinks = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -218,9 +259,22 @@ class OptimizedAttention(nn.Module):
             offset = past_kv[0].shape[2]  # Past sequence length
         q, k = self.rope(q, k, seq_len, offset)
 
+        # Add attention sinks if configured (before GQA repeat)
+        if self.config.num_attention_sinks > 0 and self.k_sinks is not None:
+            # Expand sinks to batch: (n_kv, D, num_sinks) -> (B, num_sinks, n_kv, D)
+            k_sink_expanded = self.k_sinks.permute(2, 0, 1).unsqueeze(0).expand(batch_size, -1, -1, -1)
+            v_sink_expanded = self.v_sinks.permute(2, 0, 1).unsqueeze(0).expand(batch_size, -1, -1, -1)
+
+            # Concatenate sinks at the front of sequence
+            k = torch.cat([k_sink_expanded, k], dim=1)  # (B, num_sinks+S, n_kv, D)
+            v = torch.cat([v_sink_expanded, v], dim=1)  # (B, num_sinks+S, n_kv, D)
+
+            # Update sequence length to include sinks
+            seq_len = seq_len + self.config.num_attention_sinks
+
         # Cache base KV (n_kv heads)
-        k_base = k  # (B,S,n_kv,D)
-        v_base = v  # (B,S,n_kv,D)
+        k_base = k  # (B,S+sinks,n_kv,D)
+        v_base = v  # (B,S+sinks,n_kv,D)
         
         # Append past KV to base (keep n_kv heads compact)
         if past_kv is not None and use_cache:
@@ -242,11 +296,21 @@ class OptimizedAttention(nn.Module):
         k_bhsd = k_rep.transpose(1, 2)   # (B,H,S,D)
         v_bhsd = v_rep.transpose(1, 2)   # (B,H,S,D)
 
+        # Build windowed attention mask if configured
+        if self.config.windowed_attention and not use_cache:
+            # Create head-specific windowed mask (bypass FA for correctness)
+            window_mask = self._build_windowed_mask(batch_size, seq_len, self.device)
+            if attn_mask is not None:
+                # Combine with existing mask
+                attn_mask = attn_mask & window_mask
+            else:
+                attn_mask = window_mask
+
         # Decide path:
         # - If a custom mask is provided (packed sequences and/or block-cross-doc),
         #   we MUST use SDPA with that mask (FA fixed kernel can't take arbitrary masks).
         # - Else, use FA when available for performance; otherwise SDPA causal.
-        use_custom_mask = attn_mask is not None
+        use_custom_mask = attn_mask is not None or self.config.windowed_attention
         can_flat_fa = (not use_custom_mask and FLASH_AVAILABLE and self.config.use_flash_attn
                        and q.is_cuda and q.dtype in (torch.float16, torch.bfloat16) and not use_cache)
         use_varlen = (can_flat_fa and VARLEN_FA_AVAILABLE and self.config.use_varlen_flash_attn
@@ -347,6 +411,31 @@ class OptimizedAttention(nn.Module):
             new_kv = (k_base.transpose(1,2).contiguous(), v_base.transpose(1,2).contiguous())
 
         return output, new_kv
+
+    def _build_windowed_mask(self, batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Build windowed attention mask with local and global heads"""
+        # Create base causal mask
+        mask = torch.ones((batch_size, seq_len, seq_len), device=device, dtype=torch.bool)
+        mask = torch.tril(mask)
+
+        if self.config.windowed_attention:
+            # Create head-specific masks (B, H, S, S)
+            head_mask = mask.unsqueeze(1).expand(-1, self.n_heads, -1, -1).clone()
+
+            # Apply windowing to local heads (heads after num_global_heads)
+            window_size = self.config.window_size
+            for h in range(self.config.num_global_heads, self.n_heads):
+                for i in range(seq_len):
+                    # Each position can only attend to window_size positions before it
+                    start = max(0, i - window_size + 1)
+                    if start > 0:
+                        head_mask[:, h, i, :start] = False
+
+            # Collapse head dimension back to (B, S, S) by taking AND across heads
+            # This ensures all heads' constraints are respected
+            mask = head_mask.all(dim=1)
+
+        return mask
 
 
 class OptimizedFFN(nn.Module):
