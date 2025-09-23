@@ -26,7 +26,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, IterableDataset
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+try:
+    from torch.amp import autocast as autocast_amp
+except ImportError:
+    from torch.cuda.amp import autocast as autocast_amp
 from torch.optim import AdamW
 
 import numpy as np
@@ -207,18 +211,13 @@ class StreamingPackedDataset(IterableDataset):
                 return random.choice([1024, 2048, 4096])
 
     def _pack_documents(self, doc_iterator, target_len: int) -> Optional[PackedDocument]:
-        """Pack multiple documents into a single sequence (no global padding)."""
+        """Pack multiple *tokenized* documents (lists of ints) into one sequence (no global padding)."""
         packed_ids, doc_spans = [], []
         current_pos = 0
         target_fill = int(target_len * self.fill_ratio)
 
-        for doc in doc_iterator:
+        for tokens in doc_iterator:
             try:
-                text = doc if isinstance(doc, str) else (doc.get("text", "") or doc.get("content", "")) if isinstance(doc, dict) else ""
-                if not text.strip():
-                    continue
-
-                tokens = self.tokenizer.encode(text, add_special_tokens=False)
                 if not tokens:
                     continue
 
@@ -244,13 +243,18 @@ class StreamingPackedDataset(IterableDataset):
             except Exception:
                 continue
 
+        # If we have room, add an end token at the tail so model learns end-stops
+        if packed_ids and (current_pos + 1) <= target_len and packed_ids[-1] != self.eod_token_id:
+            packed_ids.append(self.eod_token_id)
+            current_pos += 1
+
         if not packed_ids:
             return None
 
         return PackedDocument(packed_ids, doc_spans, len(packed_ids))
 
     def _read_jsonl_file(self, filepath: str):
-        """Read and yield documents from JSONL file"""
+        """Read and yield documents (dict or str) from JSONL file"""
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 for line in f:
@@ -263,22 +267,57 @@ class StreamingPackedDataset(IterableDataset):
         except Exception:
             pass
 
+    def _batched_token_stream(self, files, batch_size: int = 64):
+        """
+        Read raw docs, batch-tokenize with the fast tokenizer once per chunk,
+        and yield lists of token-id sequences. This drastically reduces Python overhead.
+        """
+        buf = []
+        def _flush(buf):
+            if not buf:
+                return []
+            # tokenizer returns dict with "input_ids"
+            enc = self.tokenizer(
+                buf,
+                add_special_tokens=False,
+                padding=False,
+                truncation=False,
+                return_attention_mask=False
+            )
+            return enc["input_ids"]
+
+        for fp in files:
+            for doc in self._read_jsonl_file(fp):
+                text = doc if isinstance(doc, str) else (doc.get("text", "") or doc.get("content", "")) if isinstance(doc, dict) else ""
+                if not text.strip():
+                    continue
+                buf.append(text)
+                if len(buf) >= batch_size:
+                    for tokens in _flush(buf):
+                        yield tokens
+                    buf.clear()
+        # tail
+        for tokens in _flush(buf):
+            yield tokens
+
     def __iter__(self):
         """Iterate over packed sequences"""
         files = list(self.files)
         random.Random(self.seed + int(time.time())).shuffle(files)
 
-        def doc_stream():
+        # Switch to token-stream that yields pre-encoded token lists
+        def token_stream():
             for filepath in files:
-                yield from self._read_jsonl_file(filepath)
+                yield from self._batched_token_stream([filepath])
 
-        doc_iter = doc_stream()
+        doc_iter = token_stream()
 
         while True:
             target_len = self._get_target_length()
             packed = self._pack_documents(doc_iter, target_len)
             if packed is None:
-                doc_iter = doc_stream()
+                # Rewind stream (end-of-epoch)
+                doc_iter = token_stream()
                 continue
 
             # Labels (shift by 1, -100 on last token; padding handled in collate_fn)
@@ -363,16 +402,18 @@ def prepare_attention_inputs(
     config: TrainingConfig,
     device: torch.device
 ) -> Dict[str, Any]:
-    """Always build a (B,S,S) block-causal mask; SDPA path in the model consumes it."""
+    """Build a (B,S,S) mask only when blocking cross-doc attention; otherwise None to keep FA fast path."""
     seq_lens = batch["seq_lens"].to(device)
     doc_spans = batch.get("doc_spans")
-
-    attn_mask = build_block_causal_mask(
-        seq_lens=seq_lens,
-        doc_spans=doc_spans,
-        block_cross_doc=config.block_cross_doc_attention,
-        device=device
-    )
+    if config.block_cross_doc_attention:
+        attn_mask = build_block_causal_mask(
+            seq_lens=seq_lens,
+            doc_spans=doc_spans,
+            block_cross_doc=True,
+            device=device
+        )
+    else:
+        attn_mask = None
     return {"seq_lens": seq_lens, "attn_mask": attn_mask, "doc_spans": doc_spans}
 
 
@@ -403,8 +444,12 @@ class Trainer:
         self.stage_tokens = 0
         self.stage_step = 0
 
-        # Accumulation estimate per stage (set in _update_stage)
-        self.gradient_accumulation_steps = max(1, self.config.tokens_per_step // stage_to_len(self.current_stage))
+        # We step when accumulated_tokens >= tokens_per_step
+        self.accum_token_cap = self.config.tokens_per_step
+        self._base_token_cap = int(self.accum_token_cap)
+        self._oom_cooldown = 0  # steps left in cooldown; 0 = inactive
+        self._oom_backoff = 0.85  # shrink to 85% on first OOM
+        self._oom_ramp = 50       # ramp back in this many optimizer steps
 
         # Metrics
         self.metrics = defaultdict(list)
@@ -421,6 +466,7 @@ class Trainer:
 
     def _create_optimizer(self) -> AdamW:
         param_groups = self.model.get_param_groups()
+        fused_ok = (torch.cuda.is_available() and hasattr(AdamW, "__init__") and "fused" in AdamW.__init__.__code__.co_varnames)
         return AdamW(
             [
                 {"params": param_groups["decay"], "weight_decay": self.config.weight_decay},
@@ -428,19 +474,22 @@ class Trainer:
             ],
             lr=self.config.learning_rate,
             betas=(self.config.adam_beta1, self.config.adam_beta2),
-            eps=self.config.adam_eps
+            eps=self.config.adam_eps,
+            **({"fused": True} if fused_ok else {})
         )
 
     def _create_scheduler(self, num_training_steps: int):
         from torch.optim.lr_scheduler import LambdaLR
         warm = self.config.warmup_steps_per_stage
-
+        base = self.config.learning_rate
+        eta_min = self.config.min_lr
         def lr_lambda(step: int) -> float:
             if step < warm:
                 return float(step) / float(max(1, warm))
             progress = float(step - warm) / float(max(1, num_training_steps - warm))
-            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
+            cos = 0.5 * (1.0 + math.cos(math.pi * progress))
+            # decay to eta_min, not zero
+            return (eta_min / base) + (1 - eta_min / base) * cos
         return LambdaLR(self.optimizer, lr_lambda)
 
     def _get_stage_max_len(self, stage: str) -> int:
@@ -468,9 +517,13 @@ class Trainer:
                     remaining_tokens = cumulative_tokens - self.global_tokens
                     est_steps = max(1, remaining_tokens // self.config.tokens_per_step)
                     self.scheduler = self._create_scheduler(est_steps)
-
-                    # Update accumulation estimate for this stage
-                    self.gradient_accumulation_steps = max(1, self.config.tokens_per_step // self._get_stage_max_len(stage))
+                    # If we loaded a checkpoint before scheduler existed, apply now
+                    if getattr(self, "_pending_sched_state", None):
+                        try:
+                            self.scheduler.load_state_dict(self._pending_sched_state)
+                        except Exception:
+                            pass
+                        self._pending_sched_state = None
                 break
 
     def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
@@ -481,21 +534,27 @@ class Trainer:
 
         attention_kwargs = prepare_attention_inputs(batch, self.config, self.device)
 
-        with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+        # Use the appropriate autocast based on device type
+        if self.device.type == "cuda" and self.use_amp:
+            with autocast_amp("cuda", enabled=True, dtype=self.amp_dtype):
+                outputs = self.model(input_ids=input_ids, labels=labels, **attention_kwargs)
+                raw_loss = outputs["loss"]
+        else:
+            # No autocast for CPU or when disabled
             outputs = self.model(input_ids=input_ids, labels=labels, **attention_kwargs)
-            loss = outputs["loss"]
+            raw_loss = outputs["loss"]
 
-        # Scale loss by estimated grad accumulation steps for this stage
-        if hasattr(self, 'gradient_accumulation_steps'):
-            loss = loss / max(1, self.gradient_accumulation_steps)
+        # Token-true scaling: each microbatch contributes proportionally to tokens_per_step
+        effective_tokens = batch["seq_lens"].sum().item()
+        scale = effective_tokens / max(1, self.config.tokens_per_step)
+        loss = raw_loss * scale
 
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
 
-        effective_tokens = batch["seq_lens"].sum().item()
-        return {"loss": loss.item(), "tokens": effective_tokens, "seq_lens": batch["seq_lens"].tolist()}
+        return {"loss": float(raw_loss.item()), "tokens": effective_tokens, "seq_lens": batch["seq_lens"].tolist()}
 
     def optimizer_step(self):
         if self.scaler is not None:
@@ -529,7 +588,7 @@ class Trainer:
             labels = batch["labels"].to(self.device, non_blocking=True)
             attention_kwargs = prepare_attention_inputs(batch, self.config, self.device)
 
-            with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+            with autocast_amp("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = self.model(input_ids=input_ids, labels=labels, **attention_kwargs)
                 loss = outputs["loss"]
 
@@ -593,8 +652,8 @@ class Trainer:
                     accumulated_tokens += step_metrics["tokens"]
                     accumulated_steps += 1
 
-                    # If enough tokens accumulated or enough microbatches (fallback), step optimizer
-                    if (accumulated_tokens >= self.config.tokens_per_step) or (accumulated_steps >= self.gradient_accumulation_steps):
+                    # Step only when token budget is met
+                    if accumulated_tokens >= self.accum_token_cap:
                         grad_norm = self.optimizer_step()
 
                         self.global_step += 1
@@ -627,6 +686,18 @@ class Trainer:
                             if self.use_wandb:
                                 wandb.log(log_dict, step=self.global_step)
 
+                        # If in OOM cooldown, ramp the token cap back up gradually
+                        if self._oom_cooldown > 0:
+                            self._oom_cooldown -= 1
+                            # linearly increase cap back to base over _oom_ramp steps
+                            done = (self._oom_ramp - self._oom_cooldown)
+                            frac = min(1.0, max(0.0, done / max(1, self._oom_ramp)))
+                            new_cap = int(self._base_token_cap * (self._oom_backoff + (1.0 - self._oom_backoff) * frac))
+                            self.accum_token_cap = max(1, new_cap)
+                            if self._oom_cooldown == 0:
+                                self.accum_token_cap = self._base_token_cap
+                                print(f"🔁 OOM cooldown ended — token cap restored to {self.accum_token_cap:,}")
+
                         accumulated_loss = 0.0
                         accumulated_tokens = 0
                         accumulated_steps = 0
@@ -651,9 +722,14 @@ class Trainer:
                             self.save_checkpoint("step")
 
                 except torch.cuda.OutOfMemoryError:
-                    print(f"⚠️  OOM at step {self.global_step}, skipping batch")
+                    print(f"⚠️  OOM at step {self.global_step}, applying temporary token-cap backoff and skipping batch")
                     torch.cuda.empty_cache()
                     self.optimizer.zero_grad(set_to_none=True)
+                    # Back off the per-step token cap for a short cooldown window
+                    self._oom_cooldown = self._oom_ramp
+                    backed = int(self._base_token_cap * self._oom_backoff)
+                    self.accum_token_cap = max(1, backed)
+                    print(f"   ↘ token cap: {self._base_token_cap:,} → {self.accum_token_cap:,} for ~{self._oom_ramp} steps")
                     continue
                 except Exception as e:
                     print(f"⚠️  Error at step {self.global_step}: {e}")
@@ -667,7 +743,10 @@ class Trainer:
             pbar.close()
             self.save_checkpoint("final")
             if self.use_wandb:
-                wandb.finish()
+                try:
+                    wandb.finish()
+                except Exception:
+                    pass
             print("\n" + "="*60)
             print("✅ Training completed!")
             print(f"   Total steps: {self.global_step}")
@@ -701,8 +780,15 @@ class Trainer:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if checkpoint.get("scheduler_state_dict") and self.scheduler:
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        # Scheduler might not exist yet; stash to apply after _create_scheduler
+        if checkpoint.get("scheduler_state_dict"):
+            if self.scheduler:
+                try:
+                    self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                except Exception:
+                    self._pending_sched_state = checkpoint["scheduler_state_dict"]
+            else:
+                self._pending_sched_state = checkpoint["scheduler_state_dict"]
         if checkpoint.get("scaler_state_dict") and self.scaler:
             self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
         self.global_step = checkpoint.get("global_step", 0)
