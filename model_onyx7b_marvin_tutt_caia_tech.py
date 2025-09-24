@@ -33,7 +33,7 @@ except Exception:
 class OnyxConfig:
     """Configuration for Onyx 7B Dense Model"""
     # Core architecture - 7B scale
-    vocab_size: int = 128256      # LLaMA 3 tokenizer
+    vocab_size: int = 128258      # Hermes Llama 3 tokenizer + <eod> token
     d_model: int = 4096           # Hidden dimension
     n_layers: int = 32            # Number of layers
     n_heads: int = 32             # Attention heads
@@ -850,7 +850,7 @@ def create_onyx_7b(
     
     # Create configuration
     config = OnyxConfig(
-        vocab_size=128256,      # LLaMA 3 tokenizer
+        vocab_size=128258,      # Hermes Llama 3 tokenizer + <eod> token
         d_model=4096,
         n_layers=32,
         n_heads=32,
