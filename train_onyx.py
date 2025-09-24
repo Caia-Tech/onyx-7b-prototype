@@ -67,7 +67,7 @@ class TrainingConfig:
     """Complete training configuration"""
     # Data
     data_glob: str = "/data/**/*.jsonl"
-    tokenizer: str = "meta-llama/Llama-3.2-1B"  # Or path
+    tokenizer: str = "NousResearch/Hermes-2-Pro-Llama-3-8B"  # Llama 3 tokenizer (128257 vocab, unrestricted)
     eval_glob: Optional[str] = None
 
     # Training
@@ -863,7 +863,7 @@ def main():
     # Data
     parser.add_argument("--data_glob", type=str, default="/data/**/*.jsonl")
     parser.add_argument("--eval_glob", type=str, default=None)
-    parser.add_argument("--tokenizer", type=str, default="meta-llama/Llama-3.2-1B")
+    parser.add_argument("--tokenizer", type=str, default="NousResearch/Hermes-2-Pro-Llama-3-8B")
 
     # Training
     parser.add_argument("--tokens_per_step", type=int, default=2_000_000)
