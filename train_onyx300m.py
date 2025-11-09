@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Training script for Onyx 125M with packed sequences.
+Training script for Onyx 300M with packed sequences.
 Simplified for training on small datasets.
 
 Author: Marvin Tutt, Caia Tech
