@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Onyx 125M Dense Model, Marvin Tutt, Caia Tech
+Onyx 300m Dense Model, Marvin Tutt, Caia Tech
 Scaled down version for faster training and experimentation
 """
 
