@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Training script for Onyx 125M with packed sequences.
-Simplified for MacBook CPU training on small datasets.
+Simplified for training on small datasets.
 
 Author: Marvin Tutt, Caia Tech
 """
@@ -20,17 +20,12 @@ import warnings
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, asdict
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, IterableDataset
-from torch.cuda.amp import GradScaler
-try:
-    from torch.amp import autocast as autocast_amp
-except ImportError:
-    from torch.cuda.amp import autocast as autocast_amp
 from torch.optim import AdamW
 
 import numpy as np
@@ -51,14 +46,6 @@ except ImportError:
 
 
 # ============================================================================
-# Helpers
-# ============================================================================
-
-def stage_to_len(stage: str) -> int:
-    return {"512": 512, "1k": 1024, "2k": 2048}[stage]
-
-
-# ============================================================================
 # Data Structures
 # ============================================================================
 
@@ -74,11 +61,7 @@ class TrainingConfig:
     tokens_per_step: int = 32_000  # Smaller for CPU
     max_steps: Optional[int] = 1000
     train_tokens_target: Optional[int] = 100_000_000  # 100M tokens
-
-    # Curriculum
-    max_stage: str = "2k"  # {512, 1k, 2k}
-    stage_schedule: Dict[str, int] = None  # Tokens per stage
-    stage_mix: Dict[str, float] = None  # Length distribution
+    max_seq_len: int = 2048  # Fixed context length
     fill_ratio: float = 0.9
     block_cross_doc_attention: bool = False
 
@@ -89,7 +72,7 @@ class TrainingConfig:
     # Optimization
     learning_rate: float = 6e-4  # Higher LR for smaller model
     min_lr: float = 6e-5
-    warmup_steps_per_stage: int = 100
+    warmup_steps: int = 100
     weight_decay: float = 0.1
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
@@ -117,19 +100,6 @@ class TrainingConfig:
     seed: int = 1337
     dry_run: bool = False
 
-    def __post_init__(self):
-        # Default stage schedule (in tokens)
-        if self.stage_schedule is None:
-            self.stage_schedule = {
-                "512": 10_000_000,
-                "1k": 30_000_000,
-                "2k": 60_000_000,
-            }
-
-        # Default stage mix
-        if self.stage_mix is None:
-            self.stage_mix = {"cur": 0.7, "mid": 0.2, "short": 0.1}
-
 
 # ============================================================================
 # Dataset and Data Loading
@@ -153,23 +123,19 @@ class StreamingPackedDataset(IterableDataset):
         self,
         file_pattern: str,
         tokenizer,
-        max_seq_len: int,
+        max_seq_len: int = 2048,
         fill_ratio: float = 0.9,
         eod_token_id: int = 3,
         pad_token_id: int = 0,
-        seed: int = 42,
-        stage_mix: Dict[str, float] = None,
-        current_stage_max: int = 2048
+        seed: int = 42
     ):
         self.file_pattern = file_pattern
         self.tokenizer = tokenizer
-        self.max_seq_len = min(max_seq_len, current_stage_max)
+        self.max_seq_len = max_seq_len
         self.fill_ratio = fill_ratio
         self.eod_token_id = eod_token_id
         self.pad_token_id = pad_token_id
         self.seed = seed
-        self.stage_mix = stage_mix or {"cur": 1.0}
-        self.current_stage_max = current_stage_max
 
         # Files
         self.files = sorted(glob.glob(file_pattern, recursive=True))
@@ -178,22 +144,7 @@ class StreamingPackedDataset(IterableDataset):
 
         # Stats
         self.stats = defaultdict(int)
-
-    def _get_target_length(self) -> int:
-        """Sample target length based on stage mix"""
-        r = random.random()
-        if self.current_stage_max <= 512:
-            return 512
-        elif self.current_stage_max <= 1024:
-            return 1024 if r < self.stage_mix.get("cur", 0.7) else 512
-        elif self.current_stage_max <= 2048:
-            if r < self.stage_mix.get("cur", 0.7):
-                return 2048
-            elif r < self.stage_mix.get("cur", 0.7) + self.stage_mix.get("mid", 0.2):
-                return 1024
-            else:
-                return 512
-        return self.current_stage_max
+        self._epoch = 0  # Track iterations for reproducible shuffling
 
     def _pack_documents(self, doc_iterator, target_len: int) -> Optional[PackedDocument]:
         """Pack multiple *tokenized* documents (lists of ints) into one sequence."""
@@ -242,15 +193,18 @@ class StreamingPackedDataset(IterableDataset):
         """Read and yield documents from JSONL file"""
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
+                for line_num, line in enumerate(f, 1):
                     if not line.strip():
                         continue
                     try:
                         yield json.loads(line)
                     except json.JSONDecodeError:
+                        self.stats["json_decode_errors"] += 1
+                        if self.stats["json_decode_errors"] <= 3:  # Log first few errors
+                            warnings.warn(f"JSON decode error in {filepath} line {line_num}", stacklevel=2)
                         continue
-        except Exception:
-            pass
+        except Exception as e:
+            warnings.warn(f"Error reading file {filepath}: {e}", stacklevel=2)
 
     def _batched_token_stream(self, files, batch_size: int = 32):
         """
@@ -286,7 +240,9 @@ class StreamingPackedDataset(IterableDataset):
     def __iter__(self):
         """Iterate over packed sequences"""
         files = list(self.files)
-        random.Random(self.seed + int(time.time())).shuffle(files)
+        # Use epoch counter for reproducible but varied shuffling
+        random.Random(self.seed + self._epoch).shuffle(files)
+        self._epoch += 1
 
         def token_stream():
             for filepath in files:
@@ -295,8 +251,7 @@ class StreamingPackedDataset(IterableDataset):
         doc_iter = token_stream()
 
         while True:
-            target_len = self._get_target_length()
-            packed = self._pack_documents(doc_iter, target_len)
+            packed = self._pack_documents(doc_iter, self.max_seq_len)
             if packed is None:
                 # Rewind stream
                 doc_iter = token_stream()
@@ -319,8 +274,7 @@ class StreamingPackedDataset(IterableDataset):
 def create_dataloader(
     config: TrainingConfig,
     tokenizer,
-    is_eval: bool = False,
-    current_stage_max: int = 2048
+    is_eval: bool = False
 ) -> DataLoader:
     """Create dataloader for training or evaluation"""
 
@@ -328,18 +282,14 @@ def create_dataloader(
     if not file_pattern:
         return None
 
-    max_len = stage_to_len(config.max_stage)
-
     dataset = StreamingPackedDataset(
         file_pattern=file_pattern,
         tokenizer=tokenizer,
-        max_seq_len=max_len,
+        max_seq_len=config.max_seq_len,
         fill_ratio=config.fill_ratio,
-        eod_token_id=tokenizer.convert_tokens_to_ids("<eod>") if "<eod>" in tokenizer.get_vocab() else 3,
-        pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
-        seed=config.seed,
-        stage_mix=config.stage_mix,
-        current_stage_max=max_len
+        eod_token_id=tokenizer.convert_tokens_to_ids("<eod>"),
+        pad_token_id=tokenizer.pad_token_id,
+        seed=config.seed
     )
 
     # Pad to LOCAL max per batch
@@ -350,7 +300,7 @@ def create_dataloader(
         doc_spans = [x["doc_spans"] for x in batch]
 
         S = max(int(t.size(0)) for t in seqs)
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        pad_id = tokenizer.pad_token_id
 
         def pad_to(t: torch.Tensor, length: int, pad_value: int):
             if t.size(0) == length:
@@ -420,16 +370,12 @@ class Trainer:
         # Training state
         self.global_step = 0
         self.global_tokens = 0
-        self.current_stage = "512"
-        self.stage_tokens = 0
-        self.stage_step = 0
-
         self.accum_token_cap = self.config.tokens_per_step
 
         # Metrics
         self.metrics = defaultdict(list)
-        self.loss_history = []
-        self.step_times = []
+        self.loss_history = deque(maxlen=1000)  # Keep last 1000 losses
+        self.step_times = deque(maxlen=100)  # Keep last 100 step times
 
         # Moving averages
         self.loss_ema = None
@@ -459,7 +405,7 @@ class Trainer:
 
     def _create_scheduler(self, num_training_steps: int):
         from torch.optim.lr_scheduler import LambdaLR
-        warm = self.config.warmup_steps_per_stage
+        warm = self.config.warmup_steps
         base = self.config.learning_rate
         eta_min = self.config.min_lr
         def lr_lambda(step: int) -> float:
@@ -469,30 +415,6 @@ class Trainer:
             cos = 0.5 * (1.0 + math.cos(math.pi * progress))
             return (eta_min / base) + (1 - eta_min / base) * cos
         return LambdaLR(self.optimizer, lr_lambda)
-
-    def _get_stage_max_len(self, stage: str) -> int:
-        return stage_to_len(stage)
-
-    def _update_stage(self):
-        """Check/update current stage based on global_tokens."""
-        stages = ["512", "1k", "2k"]
-        cumulative_tokens = 0
-        for stage in stages:
-            if stage not in self.config.stage_schedule:
-                continue
-            stage_budget = self.config.stage_schedule[stage]
-            cumulative_tokens += stage_budget
-            if self.global_tokens < cumulative_tokens:
-                if stage != self.current_stage:
-                    print(f"\n📈 Advancing to stage: {stage} (max_len={self._get_stage_max_len(stage)})")
-                    self.current_stage = stage
-                    self.stage_tokens = 0
-                    self.stage_step = 0
-
-                    remaining_tokens = cumulative_tokens - self.global_tokens
-                    est_steps = max(1, remaining_tokens // self.config.tokens_per_step)
-                    self.scheduler = self._create_scheduler(est_steps)
-                break
 
     def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
         self.model.train()
@@ -504,16 +426,13 @@ class Trainer:
 
         # No autocast for CPU
         outputs = self.model(input_ids=input_ids, labels=labels, **attention_kwargs)
-        raw_loss = outputs["loss"]
-
-        # Token-true scaling
+        loss = outputs["loss"]
         effective_tokens = batch["seq_lens"].sum().item()
-        scale = effective_tokens / max(1, self.config.tokens_per_step)
-        loss = raw_loss * scale
 
+        # Backward pass - gradients accumulate naturally
         loss.backward()
 
-        return {"loss": float(raw_loss.item()), "tokens": effective_tokens, "seq_lens": batch["seq_lens"].tolist()}
+        return {"loss": float(loss.item()), "tokens": effective_tokens, "seq_lens": batch["seq_lens"].tolist()}
 
     def optimizer_step(self):
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
@@ -570,6 +489,12 @@ class Trainer:
         step_start_time = time.time()
 
         total_steps = self.config.max_steps or (self.config.train_tokens_target // self.config.tokens_per_step)
+
+        # Create scheduler once at the beginning with total steps
+        if self.scheduler is None:
+            self.scheduler = self._create_scheduler(total_steps)
+            print(f"📅 Learning rate scheduler initialized for {total_steps} steps\n")
+
         pbar = tqdm(total=total_steps, initial=self.global_step, desc="Training", ncols=120)
 
         def signal_handler(signum, frame):
@@ -589,13 +514,6 @@ class Trainer:
                     print("\n✅ Reached maximum steps!")
                     break
 
-                # Stage updates
-                self._update_stage()
-                stage_len = self._get_stage_max_len(self.current_stage)
-                if hasattr(train_dataloader, "dataset"):
-                    train_dataloader.dataset.current_stage_max = stage_len
-                    train_dataloader.dataset.max_seq_len = stage_len
-
                 # Train step
                 try:
                     step_metrics = self.train_step(batch)
@@ -613,8 +531,6 @@ class Trainer:
 
                         self.global_step += 1
                         self.global_tokens += accumulated_tokens
-                        self.stage_tokens += accumulated_tokens
-                        self.stage_step += 1
 
                         avg_loss = accumulated_loss / max(1, accumulated_steps)
                         tokens_per_sec = accumulated_tokens / max(1e-6, (time.time() - last_log_time))
@@ -649,7 +565,7 @@ class Trainer:
                         if self.global_step % self.config.log_every == 0:
                             # Print detailed step information
                             print("\n" + "─" * 80, flush=True)
-                            print(f"📊 Step {self.global_step}/{total_steps} | Stage: {self.current_stage} | "
+                            print(f"📊 Step {self.global_step}/{total_steps} | "
                                   f"Tokens: {self.global_tokens:,}/{self.config.train_tokens_target:,}", flush=True)
                             print(f"   Loss:          {avg_loss:.6f} {loss_trend}", flush=True)
                             print(f"   Loss (EMA):    {self.loss_ema:.6f}", flush=True)
@@ -680,7 +596,6 @@ class Trainer:
                                 "grad_norm": grad_norm,
                                 "tokens/sec": tokens_per_sec,
                                 "step_time": step_time,
-                                "stage": self.current_stage,
                                 "global_tokens": self.global_tokens,
                                 "batch_tokens": accumulated_tokens,
                             }
@@ -780,15 +695,14 @@ class Trainer:
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
             "config": asdict(self.config),
             "global_step": self.global_step,
             "global_tokens": self.global_tokens,
-            "current_stage": self.current_stage,
-            "stage_tokens": self.stage_tokens,
             "best_eval_loss": self.best_eval_loss,
             "metrics": dict(self.metrics)
         }
+        if self.scheduler is not None:
+            checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
         path = Path(self.checkpoint_dir) / f"checkpoint_{tag}_{self.global_step}.pt"
         torch.save(checkpoint, path)
         shutil.copy(path, Path(self.checkpoint_dir) / "checkpoint_latest.pt")
@@ -801,15 +715,16 @@ class Trainer:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if checkpoint.get("scheduler_state_dict") and self.scheduler:
-            try:
+
+        # Load scheduler state if both checkpoint has it and scheduler exists
+        if "scheduler_state_dict" in checkpoint:
+            if self.scheduler is not None:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            except Exception:
-                pass
+            else:
+                warnings.warn("Checkpoint contains scheduler state but no scheduler initialized", stacklevel=2)
+
         self.global_step = checkpoint.get("global_step", 0)
         self.global_tokens = checkpoint.get("global_tokens", 0)
-        self.current_stage = checkpoint.get("current_stage", "512")
-        self.stage_tokens = checkpoint.get("stage_tokens", 0)
         self.best_eval_loss = checkpoint.get("best_eval_loss", float('inf'))
         self.metrics = defaultdict(list, checkpoint.get("metrics", {}))
         print(f"✅ Resumed from checkpoint: step={self.global_step}, tokens={self.global_tokens:,}")
@@ -832,9 +747,7 @@ def main():
     parser.add_argument("--tokens_per_step", type=int, default=32_000)
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--train_tokens_target", type=int, default=100_000_000)
-
-    # Curriculum
-    parser.add_argument("--max_stage", type=str, default="2k", choices=["512", "1k", "2k"])
+    parser.add_argument("--max_seq_len", type=int, default=2048)
     parser.add_argument("--fill_ratio", type=float, default=0.9)
 
     # Optimization
@@ -870,12 +783,24 @@ def main():
     print(f"📚 Loading tokenizer: {config.tokenizer}")
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, use_fast=True, trust_remote_code=True)
 
-    # Add <eod> token
+    # Add special tokens BEFORE creating model
+    special_tokens = {}
     if "<eod>" not in tokenizer.get_vocab():
-        tokenizer.add_special_tokens({"additional_special_tokens": ["<eod>"]})
+        special_tokens["additional_special_tokens"] = tokenizer.additional_special_tokens + ["<eod>"]
+
+    # Add proper pad token instead of reusing EOS
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        if "<pad>" not in tokenizer.get_vocab():
+            special_tokens["pad_token"] = "<pad>"
+        else:
+            tokenizer.pad_token = "<pad>"
+
+    if special_tokens:
+        num_added = tokenizer.add_special_tokens(special_tokens)
+        print(f"   Added {num_added} special tokens to vocabulary")
+
     eod_id = tokenizer.convert_tokens_to_ids("<eod>")
+    print(f"   Vocab size: {len(tokenizer)}, PAD: {tokenizer.pad_token_id}, EOS: {tokenizer.eos_token_id}, EOD: {eod_id}")
 
     # Model
     print("🔨 Creating Onyx 125M model...")
@@ -897,9 +822,27 @@ def main():
 
     print(f"✅ Model created: {model.get_num_params():,} parameters")
 
+    # Validate data files
+    print("🔍 Validating data files...")
+    train_files = sorted(glob.glob(config.data_glob, recursive=True))
+    if not train_files:
+        raise ValueError(f"No training files found matching pattern: {config.data_glob}")
+    print(f"   Found {len(train_files)} training file(s)")
+
+    # Check if files are readable and have content
+    total_lines = 0
+    for fpath in train_files[:min(5, len(train_files))]:  # Check first 5 files
+        try:
+            with open(fpath, 'r') as f:
+                line_count = sum(1 for _ in f)
+                total_lines += line_count
+        except Exception as e:
+            raise ValueError(f"Cannot read training file {fpath}: {e}")
+    print(f"   Sample files contain ~{total_lines:,} lines")
+
     # Dataloaders
     print("📊 Creating dataloaders...")
-    train_dataloader = create_dataloader(config, tokenizer, is_eval=False, current_stage_max=2048)
+    train_dataloader = create_dataloader(config, tokenizer, is_eval=False)
     eval_dataloader = None
 
     # Trainer
